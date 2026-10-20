@@ -465,7 +465,20 @@ def _redactar(pregunta, historial, evidencia, solo_contexto=False):
         "No digas 'Según los datos de Supabase' como muletilla. "
         "Si se solicita un gráfico o tabla, describe brevemente el resultado, NUNCA des instrucciones para crearlo ni digas que el usuario debe seleccionar opciones en otro panel. "
         "No incluyas una tabla Markdown ni un gráfico ASCII; la interfaz los muestra "
-        "separadamente cuando el usuario los solicita."
+        "separadamente cuando el usuario los solicita. "
+        "Actúa como un agente analista: responde primero la pregunta de forma precisa; "
+        "después interpreta el significado operativo cuando aporte valor. "
+        "Para solicitudes de diagnóstico, explica hallazgos, riesgos y acciones "
+        "priorizadas basadas en evidencia. Distingue hechos comprobados de hipótesis. "
+        "En preguntas sencillas sé breve y natural, sin secciones artificiales. "
+        "En preguntas amplias desarrolla un análisis estructurado, claro y accionable. "
+        "Si la evidencia solo incluye un conteo, no infieras estado de stock, "
+        "desabastecimiento ni salud del inventario. Sugiere como máximo una pregunta "
+        "de seguimiento útil cuando corresponda. "
+        "No agregues notas genéricas sobre planes, límites de muestras o registros "
+        "faltantes a menos que la evidencia indique una limitación concreta. "
+        "Si el resultado es un conteo calculado, preséntalo como tal. "
+        "Nunca afirmes haber realizado acciones que no ejecutaste."
     )
     carga = {"pregunta": pregunta, "historial": _historial_contexto(historial),
              "evidencia": evidencia[:12000], "modo": "seguimiento" if solo_contexto else "consulta"}
@@ -883,8 +896,8 @@ def consultar(pregunta, datos, historial):
         return resumen, [], None, detalles
     evidencia = ("Consulta de datos interpretada: " + pregunta_datos + "\n"
                  "Resultado calculado con pandas: " + resumen + "\n"
-                 "Advertencia: los listados pueden estar limitados por el plan. "
-                 "No extrapoles de una muestra al inventario completo.")
+                 "Contexto técnico: el cálculo se hizo sobre los registros cargados; "
+                 "si hay un límite de lectura confirmado, se indicará explícitamente.")
     if pide_visual and grafico is None and re.search(r"\b(grafico|graficos|grafica|graficas|barras|circular|pastel|donut|horizontal)\b", normal):
         return ("No pude generar un gráfico válido con esos datos. Indica qué variable deseas comparar.",
                 [], None, detalles)
