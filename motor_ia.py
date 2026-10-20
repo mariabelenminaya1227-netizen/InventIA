@@ -800,6 +800,132 @@ def _consulta_comprobable(pregunta, datos):
     return None
 
 
+def _control_stock_verificable(pregunta, datos):
+    """Resuelve existencias agotadas y mínimos desde pandas, sin depender de Groq.
+
+    Importante: una fila de almacén sin stock NO implica que el producto
+    esté agotado en todos los almacenes.
+    """
+    n = sin_tildes(pregunta)
+    pregunta_minimos = bool(
+        "minim" in n and re.search(r"\b(bajo|bajos|debajo|menor|menores|inferior|inferiores|faltante|faltantes|reposicion|reponer)\b", n)
+        and ("stock" in n or "producto" in n or "inventario" in n or "existencia" in n)
+    )
+    pregunta_agotados = bool(
+        re.search(r"\b(agotad\w*|sin existencias|sin stock|sin unidades|stock (?:en )?cero)\b", n)
+        and ("producto" in n or "articulo" in n or "inventario" in n or "almacen" in n)
+    )
+    if not pregunta_minimos and not pregunta_agotados:
+        return None
+
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty:
+        return ("No hay datos de la vista de inventario disponibles para verificar esa consulta.",
+                [], None, {"tipo": "sin_datos_stock"})
+    if "stock_actual" not in vista.columns:
+        return ("No puedo comprobar las existencias: falta la columna stock_actual.",
+                [], None, {"tipo": "columna_faltante"})
+
+    stock = pd.to_numeric(vista["stock_actual"], errors="coerce")
+    invalidos = int(stock.isna().sum())
+    registros_cero = int(stock.eq(0).sum())
+
+    # Si se pide explícitamente agotamiento, el total de TODAS las ubicaciones
+    # tiene prioridad sobre cualquier mención adicional al mínimo.
+    if pregunta_agotados:
+        identificador = "id_producto" if "id_producto" in vista.columns else (
+            "producto" if "producto" in vista.columns else None)
+        if identificador is None:
+            return ("No puedo identificar productos únicos: falta id_producto o producto.",
+                    [], None, {"tipo": "columna_faltante"})
+        # Sin ID ni nombre no se pueden considerar dos filas como el mismo producto.
+        filas = vista.copy()
+        filas["_clave"] = filas[identificador]
+        filas["_stock"] = stock
+        identificables = filas["_clave"].notna() & filas["_clave"].astype(str).str.strip().ne("")
+        sin_id = int((~identificables).sum())
+        filas = filas.loc[identificables].copy()
+        if filas.empty:
+            return ("No hay identificadores de producto válidos para sumar el stock entre almacenes.",
+                    [], None, {"tipo": "sin_id_producto"})
+        resumen = filas.groupby("_clave", dropna=False)["_stock"].agg(
+            stock_total=lambda x: x.sum(min_count=1),
+            registros="size",
+            registros_sin_dato=lambda x: int(x.isna().sum()),
+            registros_en_cero=lambda x: int(x.eq(0).sum()),
+        ).reset_index()
+        completos = resumen["registros_sin_dato"].eq(0)
+        agotados = resumen.loc[completos & resumen["stock_total"].eq(0)].copy()
+        agotados = agotados.sort_values("_clave", key=lambda c: c.astype(str).str.casefold())
+        nombres = None
+        if identificador == "id_producto" and "producto" in filas.columns:
+            nombres = (filas.dropna(subset=["producto"]).drop_duplicates("_clave")
+                       .set_index("_clave")["producto"])
+        elif identificador == "id_producto":
+            catalogo = datos.get("productos")
+            if catalogo is not None and not catalogo.empty and "id_producto" in catalogo.columns:
+                c_nombre = next((c for c in ("nombre", "nombre_producto", "producto") if c in catalogo.columns), None)
+                if c_nombre:
+                    nombres = (catalogo.dropna(subset=[c_nombre]).drop_duplicates("id_producto")
+                               .set_index("id_producto")[c_nombre])
+        if nombres is not None:
+            agotados["Producto"] = agotados["_clave"].map(nombres).fillna(agotados["_clave"].astype(str))
+        else:
+            agotados["Producto"] = agotados["_clave"].astype(str)
+        detalle = agotados[["Producto", "stock_total", "registros"]].rename(columns={
+            "stock_total": "Stock total", "registros": "Registros de almacén"})
+        dudosos = int((~completos).sum())
+        nombre_productos = "producto único completamente agotado" if len(agotados) == 1 else "productos únicos completamente agotados"
+        texto = (f"**{len(agotados)} {nombre_productos}**, "
+                 f"tras sumar su stock en todos los almacenes disponibles. "
+                 f"Hay **{registros_cero} registros por almacén con stock cero**; "
+                 "no equivalen a productos únicos agotados.")
+        if dudosos or sin_id or invalidos:
+            texto += (f"\n\n**Calidad de datos:** {dudosos} productos con alguna existencia sin dato "
+                      f"y {sin_id} registros sin identificador; no los clasifiqué como agotados.")
+        if detalle.empty:
+            texto += ("\n\nNo se confirmó ningún producto con existencias totales en cero "
+                      "entre los productos con datos completos.")
+            tablas = []
+        else:
+            texto += "\n\n**Prioridad:** revisa la demanda, criticidad y los últimos movimientos de estos productos antes de decidir su reposición."
+            tablas = [("Productos agotados en todos los almacenes", detalle)]
+        return texto, tablas, None, {
+            "tipo": "agotados_global", "productos_agotados": len(agotados),
+            "registros_cero": registros_cero, "filas_filtradas": len(agotados)}
+
+    if "stock_minimo" not in vista.columns:
+        return ("No puedo comparar el stock con el mínimo: falta la columna stock_minimo.",
+                [], None, {"tipo": "columna_faltante"})
+    minimo = pd.to_numeric(vista["stock_minimo"], errors="coerce")
+    comparable = stock.notna() & minimo.notna()
+    debajo = comparable & stock.lt(minimo)
+    cantidad = int(debajo.sum())
+    minimo_cero = int((comparable & minimo.eq(0)).sum())
+    etiqueta_registros = ("registro de producto y almacén está" if cantidad == 1
+                         else "registros de producto y almacén están")
+    texto = (f"**{cantidad} {etiqueta_registros} por debajo del stock mínimo configurado.** "
+             "La comparación se realiza por almacén, no por producto único.")
+    if cantidad == 0:
+        texto += " No se detectaron registros por debajo del mínimo establecido."
+    if minimo_cero:
+        texto += (f"\n\n**Atención:** {minimo_cero} registros tienen un mínimo configurado en cero; "
+                  "por eso esta comparación no garantiza que todas las existencias sean suficientes.")
+    incompletos = int((~comparable).sum())
+    if incompletos:
+        texto += f"\n\nNo fue posible comparar {incompletos} registros por falta de datos numéricos."
+    detalle = vista.loc[debajo, [c for c in ("producto", "id_producto", "almacen", "stock_actual", "stock_minimo")
+                                if c in vista.columns]].copy()
+    if "producto" in detalle.columns and "id_producto" in detalle.columns:
+        detalle = detalle.drop(columns=["id_producto"])
+    if not detalle.empty and "stock_actual" in detalle.columns:
+        detalle["stock_actual"] = pd.to_numeric(detalle["stock_actual"], errors="coerce")
+        detalle = detalle.sort_values("stock_actual")
+    return texto, ([("Registros bajo el mínimo", detalle)] if not detalle.empty else []), None, {
+        "tipo": "stock_bajo_minimo", "registros_bajo_minimo": cantidad,
+        "minimos_en_cero": minimo_cero, "filas_filtradas": cantidad}
+
+
 def _diagnostico_integral(pregunta, datos, historial):
     """Diagnóstico inicial verificable: no exige una consulta previa."""
     n = sin_tildes(pregunta)
@@ -825,10 +951,15 @@ def _diagnostico_integral(pregunta, datos, historial):
         validos = stock.notna()
         hechos.append(f"Existencias registradas (suma de cantidades): {stock.sum():,.0f}.")
         ceros = int((stock.eq(0) & validos).sum())
-        hechos.append(f"Registros con existencias en cero: {ceros}.")
+        hechos.append(f"Registros con existencias en cero: {ceros} (son filas por almacén, NO productos únicos agotados).")
+        identificador = "id_producto" if "id_producto" in vista.columns else "producto" if "producto" in vista.columns else None
+        if identificador and stock.notna().all() and vista[identificador].notna().all():
+            totales_producto = vista.assign(_stock=stock).groupby(identificador, dropna=False)["_stock"].sum()
+            agotados_unicos = int(totales_producto.eq(0).sum())
+            hechos.append(f"Productos únicos totalmente agotados sumando todos los almacenes: {agotados_unicos}.")
         if ceros:
-            riesgo.append(f"Hay {ceros} registros sin existencias; comprobar si son productos activos y demandados antes de definir reposición.")
-            acciones.append("Verificar los productos sin existencias y priorizar reposición según demanda y criticidad.")
+            riesgo.append(f"Hay {ceros} registros por almacén sin existencias; no concluir que son {ceros} productos agotados.")
+            acciones.append("Verificar productos agotados en el conjunto de almacenes y priorizar según demanda y criticidad.")
         if "stock_minimo" in vista.columns:
             minimo = pd.to_numeric(vista["stock_minimo"], errors="coerce")
             comparables = validos & minimo.notna()
@@ -873,7 +1004,9 @@ def _diagnostico_integral(pregunta, datos, historial):
                  + "\nRIESGOS A EVALUAR (no afirmar consecuencias no comprobadas):\n- "
                  + "\n- ".join(riesgo or ["No se ha confirmado un riesgo específico adicional con estos indicadores."])
                  + "\nTRES ACCIONES PROPUESTAS:\n1. " + "\n2. ".join(acciones[:3])
-                 + "\nIMPORTANTE: no presentar registros con mínimo=0 y stock=0 como reposición urgente automática. "
+                 + "\nIMPORTANTE: nunca confundas registros de almacén con productos únicos agotados; "
+                   "solo usa el número de productos únicos totalmente agotados calculado. "
+                   "No presentar registros con mínimo=0 y stock=0 como reposición urgente automática. "
                    "No inventar rotación, ventas ni días de cobertura. No sumar cantidades de distintas unidades "
                    "como si fueran unidades físicas homogéneas.")
     respuesta = _redactar(pregunta, historial, evidencia)
@@ -977,6 +1110,10 @@ def _analisis_movimientos_mensuales(pregunta, datos, historial):
 
 
 def consultar(pregunta, datos, historial):
+    # Consultas críticas calculadas sin depender del JSON generado por Groq.
+    control = _control_stock_verificable(pregunta, datos)
+    if control is not None:
+        return control
     # Diagnóstico desde la primera pregunta, sin exigir historial previo.
     diagnostico = _diagnostico_integral(pregunta, datos, historial)
     if diagnostico is not None:
