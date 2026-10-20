@@ -1,0 +1,11 @@
+streamlit
+pandas
+plotly
+supabase
+groq
+python-dotenv
+reportlab
+matplotlib
+Pillow
+numpy
+requests
