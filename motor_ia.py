@@ -106,6 +106,45 @@ No ejecutes código ni SQL. Si no se puede responder, pon operacion 'rows' y exp
                 continue
     raise ValueError("Groq no devolvió un plan de consulta utilizable.")
 
+def _mejorar_contraste_grafico(figura):
+    """Asegura leyendas y etiquetas legibles en los gráficos de InventIA."""
+    if figura is None:
+        return None
+    if isinstance(figura, list):
+        return [_mejorar_contraste_grafico(f) for f in figura]
+
+    figura.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0c2949",
+        plot_bgcolor="#0c2949",
+        font=dict(color="#ffffff", size=13),
+        title_font=dict(color="#ffffff", size=17),
+        legend=dict(
+            font=dict(color="#ffffff", size=12),
+            title=dict(font=dict(color="#ffffff")),
+            bgcolor="rgba(0,0,0,0)",
+            orientation="v",
+            x=1.02,
+            xanchor="left",
+            y=0.5,
+            yanchor="middle",
+        ),
+        hoverlabel=dict(bgcolor="#163b61", font=dict(color="#ffffff")),
+        margin=dict(l=35, r=35, t=40, b=40),
+        height=470,
+    )
+    figura.update_xaxes(tickfont=dict(color="#ffffff"), title_font=dict(color="#ffffff"))
+    figura.update_yaxes(tickfont=dict(color="#ffffff"), title_font=dict(color="#ffffff"))
+    if any(trazo.type == "pie" for trazo in figura.data):
+        figura.update_traces(
+            selector=dict(type="pie"),
+            textposition="inside",
+            textfont=dict(color="#ffffff", size=13),
+            marker=dict(line=dict(color="#0c2949", width=1)),
+        )
+    return figura
+
+
 def calcular(plan,datos,pregunta):
     tabla=plan.get("tabla","vista_inventario")
     if tabla not in datos or datos[tabla].empty:
@@ -390,6 +429,7 @@ def calcular(plan,datos,pregunta):
                                  font_color="#f4f8ff", height=400)
             barras.update_traces(texttemplate="%{y:,.0f}", textposition="outside", cliponaxis=False)
             grafico = [grafico, barras]
+    grafico = _mejorar_contraste_grafico(grafico)
     tablas=[("Resultados",resultado)] if visual in ("tabla","ambos") else []
     return texto,tablas,grafico,{"plan":plan,"filas_filtradas":len(df)}
 
@@ -432,7 +472,8 @@ def _decidir_intencion(pregunta, historial):
         "pregunta_datos incluyendo la métrica y agrupación del historial. "
         "Para consultar, reescribe pregunta_datos como consulta autónoma que conserve "
         "referencias del contexto (por ejemplo, 'ese almacén'). "
-        "No inventes datos. Para analizar, pregunta_datos puede quedar vacía."
+        "Si el usuario pide analizar todo su inventario, se debe consultar primero datos actuales "
+        "aunque no haya historial. No inventes datos. Para analizar, pregunta_datos puede quedar vacía."
     )
     respuesta = _cliente_ia().chat.completions.create(
         model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0,
@@ -478,7 +519,13 @@ def _redactar(pregunta, historial, evidencia, solo_contexto=False):
         "No agregues notas genéricas sobre planes, límites de muestras o registros "
         "faltantes a menos que la evidencia indique una limitación concreta. "
         "Si el resultado es un conteo calculado, preséntalo como tal. "
-        "Nunca afirmes haber realizado acciones que no ejecutaste."
+        "Nunca afirmes haber realizado acciones que no ejecutaste. "
+        "El valor del stock no es ingreso, utilidad, popularidad ni prueba de rotación. "
+        "No supongas que artículos aparentemente comunes tienen alta demanda. "
+        "Antes de pedir al usuario datos externos, usa la evidencia disponible; "
+        "si no hay registros de ventas, explica que las salidas pueden no ser ventas. "
+        "Al recibir una solicitud de diagnóstico global, usa hechos, riesgos y tres acciones "
+        "priorizadas en vez de responder que necesitas una consulta anterior."
     )
     carga = {"pregunta": pregunta, "historial": _historial_contexto(historial),
              "evidencia": evidencia[:12000], "modo": "seguimiento" if solo_contexto else "consulta"}
@@ -752,7 +799,191 @@ def _consulta_comprobable(pregunta, datos):
         return f"Ranking por {campo.replace('_', ' ')} (precio unitario; no son unidades de stock):\n" + texto, tablas, grafico, detalle
     return None
 
+
+def _diagnostico_integral(pregunta, datos, historial):
+    """Diagnóstico inicial verificable: no exige una consulta previa."""
+    n = sin_tildes(pregunta)
+    # Solo análisis global; no interceptar listas, rankings ni preguntas concretas.
+    solicita = bool(re.search(r"\b(analiz|diagnostic|evalu|auditor|estado general|como esta|situacion general|riesgos? principales|acciones prioritarias|mejorar mi inventario)\w*", n))
+    global_inventario = bool(re.search(r"\b(mi inventario|el inventario|inventario completo|existencias generales|stock general)\b", n))
+    especifica = bool(re.search(r"\b(10 productos|ranking|mayor valor|precio|grafico|tabla|rotacion|movimientos|mensual|producto\s+\w+)\b", n))
+    if not (solicita and global_inventario and not especifica):
+        return None
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty:
+        return ("No puedo realizar el diagnóstico porque no se cargaron registros de inventario.", [], None, {"tipo": "diagnostico", "filas_filtradas": 0})
+
+    hechos = [f"Registros por producto y almacén consultados: {len(vista)}."]
+    if "id_producto" in vista.columns:
+        hechos.append(f"Productos únicos: {vista['id_producto'].nunique()}.")
+    elif "producto" in vista.columns:
+        hechos.append(f"Productos distintos por nombre: {vista['producto'].nunique()}.")
+    riesgo = []
+    acciones = []
+    if "stock_actual" in vista.columns:
+        stock = pd.to_numeric(vista["stock_actual"], errors="coerce")
+        validos = stock.notna()
+        hechos.append(f"Existencias registradas (suma de cantidades): {stock.sum():,.0f}.")
+        ceros = int((stock.eq(0) & validos).sum())
+        hechos.append(f"Registros con existencias en cero: {ceros}.")
+        if ceros:
+            riesgo.append(f"Hay {ceros} registros sin existencias; comprobar si son productos activos y demandados antes de definir reposición.")
+            acciones.append("Verificar los productos sin existencias y priorizar reposición según demanda y criticidad.")
+        if "stock_minimo" in vista.columns:
+            minimo = pd.to_numeric(vista["stock_minimo"], errors="coerce")
+            comparables = validos & minimo.notna()
+            bajo = int((comparables & stock.lt(minimo)).sum())
+            igual = int((comparables & stock.eq(minimo)).sum())
+            minimo_cero = int((comparables & minimo.eq(0)).sum())
+            igualdad_cero = int((comparables & stock.eq(0) & minimo.eq(0)).sum())
+            hechos.extend([f"Registros por debajo del mínimo definido: {bajo}.",
+                           f"Registros exactamente en el mínimo: {igual} (de estos, {igualdad_cero} tienen mínimo y stock en cero).",
+                           f"Registros con mínimo configurado en cero: {minimo_cero}."])
+            if bajo:
+                riesgo.append(f"Hay {bajo} registros por debajo de su mínimo configurado.")
+                acciones.insert(0, "Revisar primero los productos por debajo del mínimo y planificar su reposición según prioridad.")
+            if minimo_cero:
+                riesgo.append("Los mínimos en cero pueden ocultar necesidades de reposición; no equivalen a stock suficiente.")
+                acciones.append("Revisar y ajustar mínimos en cero usando demanda histórica y tiempos de reabastecimiento.")
+        if "almacen" in vista.columns:
+            grupos = vista.assign(_stock_calculado=stock).groupby("almacen", dropna=False)["_stock_calculado"].sum().sort_values(ascending=False)
+            hechos.append("Existencias por almacén: " + "; ".join(f"{nombre}: {cantidad:,.0f}" for nombre, cantidad in grupos.items()) + ".")
+            if len(grupos) > 1 and grupos.sum() > 0:
+                concentracion = float(grupos.iloc[0] / grupos.sum() * 100)
+                hechos.append(f"Participación del almacén con más existencias: {concentracion:.2f}%.")
+                if concentracion >= 90:
+                    riesgo.append("Las existencias están concentradas en un almacén; esto requiere contrastarse con la operación, sin asumir que la distribución sea incorrecta.")
+                    acciones.append("Evaluar la distribución por almacén frente a la demanda y función de cada sede.")
+    if "valor_stock" in vista.columns:
+        valor = pd.to_numeric(vista["valor_stock"], errors="coerce")
+        hechos.append(f"Valor agregado del inventario: {valor.sum():,.2f} (sin asumir moneda).")
+    if not acciones:
+        acciones = ["Validar mínimos de reposición y calidad de los datos.",
+                    "Revisar productos sin existencias o con movimientos inusuales.",
+                    "Comparar existencias con movimientos y demanda, cuando estén disponibles."]
+    while len(acciones) < 3:
+        for pendiente in ["Contrastar existencias con demanda histórica, si existe registro de salidas.",
+                          "Revisar la actualización y consistencia del inventario por almacén.",
+                          "Definir indicadores y realizar un seguimiento periódico de los mínimos."]:
+            if pendiente not in acciones:
+                acciones.append(pendiente)
+                break
+    evidencia = ("DIAGNÓSTICO AUTOMÁTICO, cálculos directos sobre vista_inventario.\n"
+                 "HECHOS VERIFICADOS:\n- " + "\n- ".join(hechos)
+                 + "\nRIESGOS A EVALUAR (no afirmar consecuencias no comprobadas):\n- "
+                 + "\n- ".join(riesgo or ["No se ha confirmado un riesgo específico adicional con estos indicadores."])
+                 + "\nTRES ACCIONES PROPUESTAS:\n1. " + "\n2. ".join(acciones[:3])
+                 + "\nIMPORTANTE: no presentar registros con mínimo=0 y stock=0 como reposición urgente automática. "
+                   "No inventar rotación, ventas ni días de cobertura. No sumar cantidades de distintas unidades "
+                   "como si fueran unidades físicas homogéneas.")
+    respuesta = _redactar(pregunta, historial, evidencia)
+    return respuesta, [], None, {"tipo": "diagnostico", "filas_filtradas": len(vista)}
+
+
+def _analisis_movimientos_mensuales(pregunta, datos, historial):
+    """Consulta movimientos reales antes de hablar de rotación o velocidad de ventas."""
+    n = sin_tildes(pregunta)
+    pide = bool(re.search(r"\b(rotacion|rotar|velocidad de venta|ventas mensuales|salidas mensuales|sobrestock|sobreinventario)\b", n))
+    # Un "sí" a la propuesta del propio agente también es seguimiento contextual.
+    if not pide and n.strip(" .!?¿¡") in ("si", "claro", "adelante", "hazlo", "por favor") and historial:
+        anterior = sin_tildes(str(historial[-1].get("respuesta", "")))
+        pide = "rotacion mensual" in anterior or "velocidad de venta" in anterior
+    if not pide:
+        return None
+    mov = datos.get("movimientos_inventario")
+    if mov is None or mov.empty:
+        return ("Revisé los movimientos de inventario, pero no hay registros disponibles para calcular salidas mensuales. "
+                "Sí puedo analizar las existencias actuales; una rotación real requiere movimientos y existencias históricas.",
+                [], None, {"tipo": "sin_movimientos"})
+    campos = set(mov.columns)
+    fecha = next((c for c in ("fecha_movimiento", "fecha", "created_at", "fecha_registro") if c in campos), None)
+    cantidad = next((c for c in ("cantidad_movimiento", "cantidad", "unidades") if c in campos), None)
+    tipo = next((c for c in ("tipo_movimiento", "tipo", "operacion") if c in campos), None)
+    if not all((fecha, cantidad, tipo)):
+        faltan = [etiqueta for etiqueta, c in (("fecha del movimiento", fecha),
+                                                ("cantidad", cantidad), ("tipo de movimiento", tipo)) if not c]
+        return ("Consulté movimientos_inventario, pero faltan los campos necesarios para un análisis mensual: "
+                + ", ".join(faltan) + ". No voy a inventar ventas ni rotación.",
+                [], None, {"tipo": "movimientos_incompletos"})
+
+    fecha_mov = pd.to_datetime(mov[fecha], errors="coerce", utc=True)
+    cantidades = pd.to_numeric(mov[cantidad], errors="coerce").abs()
+    salidas = mov[tipo].astype(str).map(sin_tildes).str.strip().str.contains(
+        r"(?:^|[^a-z])(?:salida|egreso|despacho|venta|out)(?:[^a-z]|$)", regex=True, na=False)
+    validos = salidas & fecha_mov.notna() & cantidades.notna()
+    if not validos.any():
+        return ("Revisé los movimientos registrados, pero no encontré salidas fechadas con cantidades válidas. "
+                "No es posible inferir ventas, rotación ni sobrestock a partir de entradas o del stock actual.",
+                [], None, {"tipo": "sin_salidas_validas"})
+
+    df = mov.loc[validos].copy()
+    df["mes"] = fecha_mov.loc[validos].dt.strftime("%Y-%m")
+    df["unidades_salida"] = cantidades.loc[validos]
+    identificador = next((c for c in ("id_producto", "producto_id", "codigo_producto", "producto", "nombre_producto") if c in df.columns), None)
+    if identificador is None:
+        agrupado = df.groupby("mes", as_index=False)["unidades_salida"].sum().sort_values("mes")
+        return ("Pude sumar las salidas por mes, pero la tabla de movimientos no tiene identificador de producto. "
+                "No puedo atribuir estos movimientos a los diez productos anteriores ni calcular su rotación individual. "
+                "Las salidas no necesariamente equivalen a ventas.",
+                [("Salidas mensuales registradas", agrupado)], None,
+                {"tipo": "salidas_mensuales", "filas_filtradas": len(df)})
+
+    # Identificar los diez productos consultados a partir del plan previo, no del texto generado por la IA.
+    ids_previos = None
+    for anterior in reversed(historial):
+        plan = (anterior.get("datos") or {}).get("plan")
+        if not isinstance(plan, dict) or plan.get("tabla") != "vista_inventario":
+            continue
+        if plan.get("agrupar") not in ("id_producto", "producto"):
+            continue
+        if plan.get("campo") != "valor_stock":
+            continue
+        vista = datos.get("vista_inventario")
+        if vista is None or vista.empty or plan["agrupar"] not in vista.columns or "valor_stock" not in vista.columns:
+            continue
+        v = vista.copy()
+        v["valor_stock"] = pd.to_numeric(v["valor_stock"], errors="coerce")
+        ranking = v.groupby(plan["agrupar"], dropna=False)["valor_stock"].sum().sort_values(ascending=False)
+        try:
+            limite = max(1, min(int(plan.get("limite") or 10), 100))
+        except (TypeError, ValueError):
+            limite = 10
+        ids_previos = {str(x).casefold() for x in ranking.head(limite).index}
+        # Movimientos y ranking deben usar la MISMA clave; de lo contrario no filtrar arbitrariamente.
+        if identificador == plan["agrupar"]:
+            break
+        ids_previos = None
+
+    if ids_previos is not None:
+        df = df[df[identificador].astype(str).str.casefold().isin(ids_previos)].copy()
+        if df.empty:
+            return ("Revisé los movimientos y el ranking previo, pero no encontré salidas vinculadas "
+                    "a esos productos mediante su identificador. No asumiré ventas ni sobrestock.",
+                    [], None, {"tipo": "sin_salidas_productos"})
+    elif re.search(r"\b(esos|estos|los 10|anteriores|mencionados)\b", n):
+        return ("Puedo consultar las salidas mensuales, pero los movimientos y el ranking anterior "
+                "no comparten un identificador de producto comprobable. No voy a atribuir "
+                "movimientos a productos equivocados. Necesitamos vincular esas claves en la base.",
+                [], None, {"tipo": "sin_clave_comun"})
+
+    agrupado = (df.groupby([identificador, "mes"], as_index=False)["unidades_salida"]
+                .sum().sort_values(["mes", "unidades_salida"], ascending=[False, False]))
+    texto = (f"Encontré {len(df)} movimientos de salida válidos, agrupados por mes y producto. "
+             "La tabla muestra **salidas registradas**, no ventas confirmadas ni rotación contable. "
+             "Para calcular rotación real se necesitan existencias promedio históricas por periodo; "
+             "el stock actual por sí solo no demuestra sobrestock.")
+    return texto, [("Salidas mensuales por producto", agrupado)], None, {
+        "tipo": "salidas_mensuales", "filas_filtradas": len(df)}
+
+
 def consultar(pregunta, datos, historial):
+    # Diagnóstico desde la primera pregunta, sin exigir historial previo.
+    diagnostico = _diagnostico_integral(pregunta, datos, historial)
+    if diagnostico is not None:
+        return diagnostico
+    rotacion = _analisis_movimientos_mensuales(pregunta, datos, historial)
+    if rotacion is not None:
+        return rotacion
     n = sin_tildes(pregunta)
     if (re.search(r"\b(porcentaje|porcentajes|porcentual|participacion|proporcion)\b", n)
             and re.search(r"\balmacen(?:es)?\b", n)
@@ -896,8 +1127,8 @@ def consultar(pregunta, datos, historial):
         return resumen, [], None, detalles
     evidencia = ("Consulta de datos interpretada: " + pregunta_datos + "\n"
                  "Resultado calculado con pandas: " + resumen + "\n"
-                 "Contexto técnico: el cálculo se hizo sobre los registros cargados; "
-                 "si hay un límite de lectura confirmado, se indicará explícitamente.")
+                 "Contexto técnico: el cálculo se hizo con pandas sobre los registros cargados. "
+                 "No supongas límites de plan ni extrapoles resultados.")
     if pide_visual and grafico is None and re.search(r"\b(grafico|graficos|grafica|graficas|barras|circular|pastel|donut|horizontal)\b", normal):
         return ("No pude generar un gráfico válido con esos datos. Indica qué variable deseas comparar.",
                 [], None, detalles)
