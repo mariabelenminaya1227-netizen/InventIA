@@ -889,59 +889,161 @@ def _conteo_productos_verificable(pregunta, datos):
             {"tipo": "conteo_productos", "productos_unicos": total})
 
 
+def _numero_es(valor, decimales=2):
+    """Formato en español para análisis, sin inventar símbolos de moneda."""
+    try:
+        valor = float(valor)
+        if not pd.notna(valor):
+            return "sin dato"
+        if abs(valor - round(valor)) < 1e-9:
+            return f"{valor:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"{valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except (ValueError, TypeError):
+        return str(valor)
+
+
 def _ranking_valor_verificable(pregunta, datos):
-    """Top de VALOR calculado sin LLM; reutilizable en gráficos posteriores."""
+    """Ranking numérico verificable + interpretación de concentración real."""
     n = sin_tildes(pregunta)
-    # Solo consultas explícitas de ranking, no otras menciones de valor o precios.
     quiere_ranking = bool(re.search(
         r"\b(?:top|ranking|mayor(?:es)?|mas|alto(?:s)?|primeros?|principales?)\b", n))
     habla_valor = bool(re.search(r"\bvalor\b", n))
     habla_producto = bool(re.search(r"\b(?:productos?|articulos?)\b", n))
-    hay_filtro_extra = bool(re.search(
+    filtro_extra = bool(re.search(
         r"\b(?:bajo|debajo|agotad\w*|minim\w*|vencim\w*|"
         r"por almac\w*|por categor\w*|solo en|solamente en)\b", n))
-    if not (quiere_ranking and habla_valor and habla_producto) or hay_filtro_extra:
+    if not (quiere_ranking and habla_valor and habla_producto) or filtro_extra:
         return None
     vista = datos.get("vista_inventario")
     if vista is None or vista.empty:
-        return ("No hay datos de inventario disponibles para calcular el ranking.", [], None,
-                {"tipo": "sin_datos"})
-    if "valor_stock" not in vista.columns:
-        return ("No es posible calcular el ranking: falta la columna valor_stock.", [], None,
-                {"tipo": "columna_faltante"})
-    agrupacion = ("id_producto" if "id_producto" in vista.columns else
-                  "producto" if "producto" in vista.columns else None)
-    if agrupacion is None:
-        return ("No puedo distinguir productos: falta id_producto o producto.", [], None,
-                {"tipo": "columna_faltante"})
+        return ("No hay datos disponibles para calcular el ranking.", [], None, {"tipo":"sin_datos"})
+    clave = "id_producto" if "id_producto" in vista.columns else "producto" if "producto" in vista.columns else None
+    if clave is None or "valor_stock" not in vista.columns:
+        return ("No puedo comprobar el ranking: faltan identificadores de producto o valor_stock.",
+                [], None, {"tipo":"columna_faltante"})
+    valores = pd.to_numeric(vista["valor_stock"], errors="coerce")
+    identificables = vista[clave].notna() & vista[clave].astype(str).str.strip().ne("")
+    if valores.isna().any() or not identificables.all():
+        return ("No es posible garantizar un ranking completo: hay valores de inventario o "
+                "identificadores de productos ausentes. Revisa esos registros antes de ordenar.",
+                [], None, {"tipo":"valores_incompletos"})
     cantidad = re.search(r"\b(?:top\s*)?(\d{1,3})\s*(?:productos?|articulos?)\b", n)
     if not cantidad:
         cantidad = re.search(r"\btop\s*(\d{1,3})\b", n)
     limite = max(1, min(int(cantidad.group(1)) if cantidad else 10, 100))
-    # Para evitar resultados erróneos si un valor no es numérico, exigir datos válidos.
-    valor = pd.to_numeric(vista["valor_stock"], errors="coerce")
-    if valor.isna().any():
-        return ("Hay valores de inventario ausentes o no numéricos; no puedo confirmar un ranking completo sin revisarlos.",
-                [], None, {"tipo": "valor_incompleto", "registros_incompletos": int(valor.isna().sum())})
-    visual = ("ambos" if "tabla" in n and re.search(r"\b(?:grafico|barras|circular)\b", n) else
-              "tabla" if "tabla" in n else
-              "grafico" if re.search(r"\b(?:grafico|barras|circular|pastel|donut)\b", n) else
-              "texto")
-    plan = {"tabla": "vista_inventario", "operacion": "sum", "campo": "valor_stock",
-            "agrupar": agrupacion, "filtros": [], "orden": "desc", "limite": limite,
-            "visual": visual}
-    resumen, tablas, grafico, detalles = calcular(plan, datos, pregunta)
-    if resumen.startswith("No "):
-        return resumen, tablas, grafico, detalles
-    # El motor entrega cifras comprobadas; no delegar al modelo la reconstrucción
-    # de un ranking, evitando cambiar cifras u ofrecer preguntas no solicitadas.
-    cantidad_real = min(limite, int(vista[agrupacion].nunique(dropna=True)))
-    encabezado = f"**Los {cantidad_real} productos de mayor valor del inventario:**"
-    nota = "\n\n*Valores expresados sin asumir una moneda.*"
-    if visual in ("grafico", "ambos") and grafico is not None:
-        return ("Aquí tienes el ranking de productos por valor del inventario." + nota,
-                tablas, grafico, detalles)
-    return encabezado + "\n\n" + resumen + nota, tablas, grafico, detalles
+    visual = ("ambos" if re.search(r"\b(?:tabla|cuadro)\b", n) and re.search(r"\b(?:grafico|barras|circular|pastel|donut)\b", n) else
+              "tabla" if re.search(r"\b(?:tabla|cuadro)\b", n) else
+              "grafico" if re.search(r"\b(?:grafico|barras|circular|pastel|donut)\b", n) else "texto")
+    plan = {"tabla":"vista_inventario", "operacion":"sum", "campo":"valor_stock",
+            "agrupar":clave, "filtros":[], "orden":"desc", "limite":limite,
+            "visual":visual}
+    _, tablas, grafico, detalles = calcular(plan, datos, pregunta)
+    # Cifras únicas calculadas sobre TODOS los registros, antes de recortar el top.
+    suma = vista.assign(_valor=valores).groupby(clave, dropna=False)["_valor"].sum().sort_values(ascending=False)
+    if suma.empty:
+        return "No hay productos para ordenar.", [], None, {"tipo":"sin_datos"}
+    if clave == "id_producto" and "producto" in vista.columns:
+        nombres = (vista.dropna(subset=["producto"])
+                   .drop_duplicates(subset=[clave]).set_index(clave)["producto"])
+    elif clave == "id_producto" and "productos" in datos and not datos["productos"].empty:
+        catalogo = datos["productos"]
+        campo_nombre = next((c for c in ("nombre", "nombre_producto", "producto", "descripcion")
+                             if c in catalogo.columns), None)
+        nombres = (catalogo.dropna(subset=[campo_nombre]).drop_duplicates(subset=[clave])
+                   .set_index(clave)[campo_nombre]) if campo_nombre and clave in catalogo.columns else None
+    else:
+        nombres = None
+    def etiqueta(clave_producto):
+        if nombres is not None:
+            nombre = nombres.get(clave_producto)
+            if pd.notna(nombre) and str(nombre).strip():
+                return str(nombre)
+        return str(clave_producto)
+    principales = suma.head(limite)
+    lineas = [f"{i}. **{etiqueta(k)}** — {_numero_es(v)}"
+              for i, (k, v) in enumerate(principales.items(), 1)]
+    total = float(suma.sum())
+    suma_principales = float(principales.sum())
+    cantidad_real = len(principales)
+    encabezado = f"**Los {cantidad_real} productos con mayor valor de inventario**"
+    hallazgos = []
+    if total > 0:
+        porcentaje = suma_principales / total * 100
+        hallazgos.append(
+            f"Los {cantidad_real} productos seleccionados concentran el **{_numero_es(porcentaje)} % "
+            f"del valor total registrado** ({_numero_es(suma_principales)} de {_numero_es(total)}).")
+        if cantidad_real >= 2:
+            mayor = float(principales.iloc[0]); segundo = float(principales.iloc[1])
+            hallazgos.append(
+                f"**{etiqueta(principales.index[0])}** encabeza el ranking con {_numero_es(mayor)}, "
+                f"una diferencia de **{_numero_es(mayor - segundo)}** frente al segundo producto.")
+        if porcentaje >= 70 and len(suma) > cantidad_real:
+            hallazgos.append("El valor registrado está concentrado en este grupo: conviene priorizar "
+                             "la verificación de sus existencias y controles de valoración.")
+        elif cantidad_real < len(suma):
+            hallazgos.append("Este es un ranking por **valor de inventario**, no por ventas, "
+                             "rentabilidad, demanda ni velocidad de rotación.")
+    elif (suma < 0).any():
+        hallazgos.append("Hay valores negativos; conviene revisar los ajustes contables antes de interpretar el ranking.")
+    if not hallazgos:
+        hallazgos.append("El valor del stock no demuestra ventas, margen ni rotación de los productos.")
+    texto = encabezado + "\n\n" + "\n".join(lineas) + "\n\n**Análisis:** " + " ".join(hallazgos)
+    texto += "\n\n*Valores sin moneda especificada.*"
+    if grafico is not None:
+        # El gráfico Plotly utiliza las mismas agrupaciones numéricas del ranking.
+        texto = encabezado + "\n\n**Análisis:** " + " ".join(hallazgos)
+    detalles["tipo"] = "ranking_valor"
+    detalles["total_valor"] = total
+    detalles["valor_top"] = suma_principales
+    detalles["productos_top"] = cantidad_real
+    # Guardar plan permite convertir el ranking anterior en gráfico sin recalcular con IA.
+    detalles["plan"] = plan
+    return texto, tablas, grafico, detalles
+
+
+def _comparacion_almacenes_verificable(pregunta, datos):
+    """Existencias por almacén: explicación con porcentajes comprobables."""
+    n = sin_tildes(pregunta)
+    menciona_almacen = bool(re.search(r"\balmacen(?:es)?\b", n))
+    tema_stock = bool(re.search(r"\b(?:stock|unidades|existencias|inventario|distribucion)\b", n))
+    consulta = bool(re.search(r"\b(?:cual|cuanto|cuantas|mas|menos|distribucion|compar|porcentaje|participacion)\b", n))
+    # No interceptar consultas por producto, mínimos o un almacén específico.
+    if not (menciona_almacen and tema_stock and consulta) or re.search(
+        r"\b(?:producto|articulo|precio|valor|vencimiento|minimo|movimiento)\b", n):
+        return None
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty or not {"almacen", "stock_actual"}.issubset(vista.columns):
+        return None
+    cantidades = pd.to_numeric(vista["stock_actual"], errors="coerce")
+    if cantidades.isna().any():
+        return ("Hay registros sin stock numérico; no puedo confirmar la distribución completa.",
+                [], None, {"tipo":"stock_incompleto"})
+    grupos = (vista.assign(_stock=cantidades)
+              .groupby("almacen", dropna=False)["_stock"].sum().sort_values(ascending=False))
+    if grupos.empty:
+        return None
+    total = float(grupos.sum())
+    mayor = grupos.index[0]
+    lineas = [f"- **{k}**: {_numero_es(v)} unidades" +
+              (f" (**{_numero_es(v / total * 100)} %** del total)" if total > 0 else "")
+              for k, v in grupos.items()]
+    texto = "**Distribución de existencias por almacén**\n\n" + "\n".join(lineas)
+    if len(grupos) > 1 and total > 0:
+        porcentaje = float(grupos.iloc[0] / total * 100)
+        texto += (f"\n\n**Análisis:** {mayor} concentra el **{_numero_es(porcentaje)} %** "
+                  "del stock numérico registrado. Esto describe la distribución, pero no demuestra "
+                  "por sí solo que sea incorrecta: depende de la función y demanda de cada almacén.")
+    else:
+        texto += "\n\n**Análisis:** No se pueden comparar almacenes sin al menos dos grupos con datos."
+    pide_grafico = bool(re.search(r"\b(?:grafico|circular|barras|pastel|donut)\b", n))
+    pide_tabla = bool(re.search(r"\b(?:tabla|cuadro)\b", n))
+    plan = {"tabla":"vista_inventario", "operacion":"sum", "campo":"stock_actual",
+            "agrupar":"almacen", "filtros":[], "orden":"desc", "limite":100,
+            "visual":"ambos" if pide_grafico and pide_tabla else "grafico" if pide_grafico else "tabla" if pide_tabla else "texto"}
+    _, tablas, grafico, detalles = calcular(plan, datos, pregunta)
+    detalles["tipo"] = "distribucion_almacenes"
+    detalles["plan"] = plan
+    return texto, tablas, grafico, detalles
 
 
 def _control_stock_verificable(pregunta, datos):
@@ -1261,6 +1363,10 @@ def _consultar_interno(pregunta, datos, historial):
     ranking = _ranking_valor_verificable(pregunta, datos)
     if ranking is not None:
         return ranking
+    # Consultas verificables de distribución, con interpretación operativa.
+    almacenes = _comparacion_almacenes_verificable(pregunta, datos)
+    if almacenes is not None:
+        return almacenes
     # Consultas críticas calculadas sin depender del JSON generado por Groq.
     control = _control_stock_verificable(pregunta, datos)
     if control is not None:
