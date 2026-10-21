@@ -504,43 +504,45 @@ def _decidir_intencion(pregunta, historial):
 
 
 def _quitar_preguntas_finales(texto):
-    """Elimina solo cierres promocionales o preguntas finales no solicitadas.
+    """Quita invitaciones finales no pedidas, respetando el análisis y sus cifras.
 
-    No modifica las cifras, listas ni explicaciones del resto de la respuesta.
+    Tolera etiquetas Markdown con el ':' dentro o fuera del negrita, y la
+    barra invertida de los saltos de línea que suelen generar los modelos.
     """
     if not texto:
         return texto
     texto = str(texto).strip()
-    # El modelo puede agregar al final una sección separada para invitar a otra consulta.
-    etiqueta = re.search(
-        r"(?im)^\s*(?:\*\*)?(?:pregunta(?: de seguimiento)?(?: sugerida| útil)?|"
-        r"siguiente pregunta|para continuar)(?:\*\*)?\s*:?\s*$", texto)
-    if etiqueta:
-        texto = texto[:etiqueta.start()].rstrip()
+    # Detectar rótulos de preguntas extra, incluso «**Pregunta de seguimiento útil:**».
+    titulo = re.compile(
+        r"^\s*(?:[>*-]\s*)?(?:#{1,4}\s*)?(?:\*\*)?\s*"
+        r"(?:pregunta(?:\s+de\s+seguimiento)?(?:\s+(?:sugerida|útil|util))?|"
+        r"siguiente\s+pregunta|para\s+continuar|puedes\s+preguntar)"
+        r"\s*:?(?:\*\*)?\s*\\?\s*$", re.I)
     lineas = texto.splitlines()
-    # Quitar invitaciones exclusivamente al FINAL para no mutilar análisis legítimos.
-    patron = re.compile(
-        r"^(?:[>*\s-]*)(?:\*\*)?\s*(?:¿\s*(?:te gustaría|quieres|deseas|"
-        r"necesitas|podemos|podríamos|prefieres)|"
-        r"(?:si (?:quieres|deseas|necesitas|te interesa)|puedo (?:ayudarte|analizar|mostrarte)|"
-        r"dime si|avísame si|¿\s*(?:hay|tienes) datos))\b", re.I)
+    for i, linea in enumerate(lineas):
+        if titulo.match(linea):
+            lineas = lineas[:i]
+            break
+    # La invitación a veces empieza al final de una línea con formato Markdown.
+    cierre = re.compile(
+        r"^\s*(?:[>*-]\s*)?(?:\*\*)?\s*(?:"
+        r"¿\s*(?:te\s+gustar[ií]a|quieres|deseas|necesitas|podemos|"
+        r"podr[ií]amos|prefieres|tienes\s+datos)|"
+        r"(?:si\s+(?:quieres|deseas|necesitas|te\s+interesa)|"
+        r"puedo\s+(?:ayudarte|analizar|mostrarte)|"
+        r"dime\s+si|av[ií]same\s+si))\b", re.I)
     while lineas:
-        ultima = lineas[-1].strip()
-        if not ultima or ultima in ('---', '***'):
-            lineas.pop()
-        elif patron.match(ultima):
-            lineas.pop()
-        elif ultima.startswith('¿') and ultima.endswith('?'):
+        final = lineas[-1].strip()
+        if not final or final in ('---', '***') or cierre.match(final) or (final.startswith('¿') and final.endswith('?')):
             lineas.pop()
         else:
             break
-    resultado = '\n'.join(lineas).rstrip()
-    # Cuando la invitación final está en la misma línea que el último dato,
-    # conservar la frase informativa y eliminar solo la pregunta comercial.
+    resultado = '\n'.join(lineas).strip()
+    # Misma línea que una conclusión; solo eliminar la invitación, no los datos.
     resultado = re.sub(
-        r"\s+¿\s*(?:Te gustaría|Quieres|Deseas|Podemos|Podríamos|Prefieres)\b[^\n?]*\?\s*$",
-        "", resultado, flags=re.I)
-    return resultado.rstrip()
+        r"\s+¿\s*(?:te\s+gustar[ií]a|quieres|deseas|podemos|podr[ií]amos|prefieres)\b[^\n?]*\?\s*$",
+        '', resultado, flags=re.I)
+    return resultado.rstrip(' \n\\')
 
 
 def _redactar(pregunta, historial, evidencia, solo_contexto=False):
@@ -579,6 +581,8 @@ def _redactar(pregunta, historial, evidencia, solo_contexto=False):
         "Si el resultado es un conteo calculado, preséntalo como tal. "
         "Nunca afirmes haber realizado acciones que no ejecutaste. "
         "El valor del stock no es ingreso, utilidad, popularidad ni prueba de rotación. "
+        "Nunca infieras márgenes, rentabilidad, punto de equilibrio, ventas estables "
+        "ni demanda o velocidad de venta a partir del valor del inventario. "
         "No supongas que artículos aparentemente comunes tienen alta demanda. "
         "Antes de pedir al usuario datos externos, usa la evidencia disponible; "
         "si no hay registros de ventas, explica que las salidas pueden no ser ventas. "
@@ -1249,7 +1253,7 @@ def _analisis_movimientos_mensuales(pregunta, datos, historial):
         "tipo": "salidas_mensuales", "filas_filtradas": len(df)}
 
 
-def consultar(pregunta, datos, historial):
+def _consultar_interno(pregunta, datos, historial):
     conteo = _conteo_productos_verificable(pregunta, datos)
     if conteo is not None:
         return conteo
@@ -1423,3 +1427,9 @@ def consultar(pregunta, datos, historial):
     if pide_visual and grafico is not None:
         respuesta = "Aquí tienes el gráfico generado con los datos consultados de tu inventario."
     return respuesta, tablas, grafico, detalles
+
+
+def consultar(pregunta, datos, historial):
+    """API estable para app.py: entrega la respuesta sin preguntas promocionales."""
+    texto, tablas, grafico, detalles = _consultar_interno(pregunta, datos, historial)
+    return _quitar_preguntas_finales(texto), tablas, grafico, detalles
