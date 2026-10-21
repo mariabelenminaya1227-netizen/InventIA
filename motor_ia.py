@@ -236,7 +236,9 @@ def calcular(plan,datos,pregunta):
         if not campos: campos=list(df.columns)[:8]
         resultado=df[campos].copy()
         if campo and campo in resultado and plan.get("orden") in ("asc","desc"):
-            resultado=resultado.sort_values(campo,ascending=plan["orden"]=="asc")
+            if campo in NUMEROS:
+                resultado[campo] = pd.to_numeric(resultado[campo], errors="coerce")
+            resultado=resultado.sort_values(campo,ascending=plan["orden"]=="asc", kind="stable")
     else:
         return "No hay información suficiente para calcular esa consulta con los campos disponibles.",[],None,{}
     # Mostrar nombres legibles al agrupar por ID de producto, sin alterar los cálculos.
@@ -390,9 +392,13 @@ def calcular(plan,datos,pregunta):
                 nombre_menor=str(resultado.loc[imin].iloc[0])
                 total=float(valores.sum())
                 diferencia=mayor-menor
-                texto+=(f"\n\n**Comparación:** {nombre_mayor} registra la mayor cantidad "
+                unidad_comparacion = ("de valor de inventario" if campo == "valor_stock" else
+                                      "unidades" if campo in ("stock_actual", "cantidad", "cantidad_movimiento") else
+                                      "en la métrica consultada")
+                texto+=(f"\n\n**Comparación:** {nombre_mayor} registra el valor más alto "
                         f"({mostrar(mayor)}), frente a {nombre_menor} "
-                        f"({mostrar(menor)}). La diferencia es de {mostrar(diferencia)} unidades.")
+                        f"({mostrar(menor)}). La diferencia es {mostrar(diferencia)} "
+                        f"{unidad_comparacion}.")
                 if total>0:
                     texto+=f" {nombre_mayor} representa el {mayor/total*100:.2f}% del total mostrado."
                 if any(t in normal for t in ("conclusion","recomend","analiza","distribu")):
@@ -444,10 +450,18 @@ def _cliente_ia():
 
 
 def _json_ia(texto):
-    coincidencia = re.search(r"\{.*\}", texto, re.S)
-    if not coincidencia:
-        raise ValueError("La IA no devolvió un plan válido. Intenta de nuevo.")
-    return json.loads(coincidencia.group())
+    """Recupera el primer objeto JSON válido aunque el modelo lo rodee de texto."""
+    decodificador = json.JSONDecoder()
+    for i, caracter in enumerate(texto or ""):
+        if caracter != "{":
+            continue
+        try:
+            objeto, _ = decodificador.raw_decode(texto[i:])
+            if isinstance(objeto, dict):
+                return objeto
+        except (ValueError, TypeError):
+            continue
+    raise ValueError("La IA no devolvió un plan JSON utilizable.")
 
 
 def _historial_contexto(historial):
@@ -488,6 +502,47 @@ def _decidir_intencion(pregunta, historial):
     return decision
 
 
+
+def _quitar_preguntas_finales(texto):
+    """Elimina solo cierres promocionales o preguntas finales no solicitadas.
+
+    No modifica las cifras, listas ni explicaciones del resto de la respuesta.
+    """
+    if not texto:
+        return texto
+    texto = str(texto).strip()
+    # El modelo puede agregar al final una sección separada para invitar a otra consulta.
+    etiqueta = re.search(
+        r"(?im)^\s*(?:\*\*)?(?:pregunta(?: de seguimiento)?(?: sugerida| útil)?|"
+        r"siguiente pregunta|para continuar)(?:\*\*)?\s*:?\s*$", texto)
+    if etiqueta:
+        texto = texto[:etiqueta.start()].rstrip()
+    lineas = texto.splitlines()
+    # Quitar invitaciones exclusivamente al FINAL para no mutilar análisis legítimos.
+    patron = re.compile(
+        r"^(?:[>*\s-]*)(?:\*\*)?\s*(?:¿\s*(?:te gustaría|quieres|deseas|"
+        r"necesitas|podemos|podríamos|prefieres)|"
+        r"(?:si (?:quieres|deseas|necesitas|te interesa)|puedo (?:ayudarte|analizar|mostrarte)|"
+        r"dime si|avísame si|¿\s*(?:hay|tienes) datos))\b", re.I)
+    while lineas:
+        ultima = lineas[-1].strip()
+        if not ultima or ultima in ('---', '***'):
+            lineas.pop()
+        elif patron.match(ultima):
+            lineas.pop()
+        elif ultima.startswith('¿') and ultima.endswith('?'):
+            lineas.pop()
+        else:
+            break
+    resultado = '\n'.join(lineas).rstrip()
+    # Cuando la invitación final está en la misma línea que el último dato,
+    # conservar la frase informativa y eliminar solo la pregunta comercial.
+    resultado = re.sub(
+        r"\s+¿\s*(?:Te gustaría|Quieres|Deseas|Podemos|Podríamos|Prefieres)\b[^\n?]*\?\s*$",
+        "", resultado, flags=re.I)
+    return resultado.rstrip()
+
+
 def _redactar(pregunta, historial, evidencia, solo_contexto=False):
     """Redacción fundamentada: los números provienen de pandas o del historial."""
     sistema = (
@@ -514,8 +569,11 @@ def _redactar(pregunta, historial, evidencia, solo_contexto=False):
         "En preguntas sencillas sé breve y natural, sin secciones artificiales. "
         "En preguntas amplias desarrolla un análisis estructurado, claro y accionable. "
         "Si la evidencia solo incluye un conteo, no infieras estado de stock, "
-        "desabastecimiento ni salud del inventario. Sugiere como máximo una pregunta "
-        "de seguimiento útil cuando corresponda. "
+        "desabastecimiento ni salud del inventario. "
+        "NUNCA termines respuestas con preguntas, ofertas de ayuda, invitaciones o "
+        "sugerencias de seguimiento que el usuario no pidió. No añadas secciones "
+        "de 'pregunta sugerida', '¿Te gustaría...?', '¿Quieres...?' ni 'Si necesitas...'. "
+        "Termina al completar la respuesta, el análisis o las acciones solicitadas. "
         "No agregues notas genéricas sobre planes, límites de muestras o registros "
         "faltantes a menos que la evidencia indique una limitación concreta. "
         "Si el resultado es un conteo calculado, preséntalo como tal. "
@@ -539,7 +597,7 @@ def _redactar(pregunta, historial, evidencia, solo_contexto=False):
             temperature=0.2, max_tokens=presupuesto, messages=mensajes)
         texto = (respuesta.choices[0].message.content or "").strip()
         if texto:
-            return texto
+            return _quitar_preguntas_finales(texto)
     return ("No pude completar la respuesta de análisis en este momento. "
             "Conservo el contexto de la conversación; vuelve a solicitar el análisis.")
 
@@ -798,6 +856,88 @@ def _consulta_comprobable(pregunta, datos):
         texto, tablas, grafico, detalle = calcular(plan, datos, pregunta)
         return f"Ranking por {campo.replace('_', ' ')} (precio unitario; no son unidades de stock):\n" + texto, tablas, grafico, detalle
     return None
+
+
+
+
+def _conteo_productos_verificable(pregunta, datos):
+    """Resuelve el total de productos únicos, no el de filas de almacenes."""
+    n = sin_tildes(pregunta)
+    es_conteo = bool(re.search(r"\b(?:cuantos?|numero|total|cantidad)\b", n))
+    pregunta_productos = bool(re.search(r"\b(?:productos?|articulos?)\b", n))
+    pide_filtro = bool(re.search(
+        r"\b(?:bajo|debajo|menos|mas|mayor|menor|sin|agotad\w*|stock|"
+        r"minim\w*|almacen\w*|categorias?|precio|valor|vencim\w*|movim\w*|"
+        r"activ\w*|inactiv\w*|proveedor\w*|marca\w*|caro\w*|barat\w*)\b", n))
+    if not (es_conteo and pregunta_productos and not pide_filtro):
+        return None
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty:
+        return ("No hay registros de inventario disponibles para contar productos.", [], None,
+                {"tipo": "sin_datos"})
+    clave = "id_producto" if "id_producto" in vista.columns else (
+        "producto" if "producto" in vista.columns else None)
+    if not clave:
+        return ("No existe una columna para identificar productos únicos.", [], None,
+                {"tipo": "columna_faltante"})
+    total = int(vista[clave].nunique(dropna=True))
+    return (f"Hay **{total} productos únicos registrados** en el inventario.", [], None,
+            {"tipo": "conteo_productos", "productos_unicos": total})
+
+
+def _ranking_valor_verificable(pregunta, datos):
+    """Top de VALOR calculado sin LLM; reutilizable en gráficos posteriores."""
+    n = sin_tildes(pregunta)
+    # Solo consultas explícitas de ranking, no otras menciones de valor o precios.
+    quiere_ranking = bool(re.search(
+        r"\b(?:top|ranking|mayor(?:es)?|mas|alto(?:s)?|primeros?|principales?)\b", n))
+    habla_valor = bool(re.search(r"\bvalor\b", n))
+    habla_producto = bool(re.search(r"\b(?:productos?|articulos?)\b", n))
+    hay_filtro_extra = bool(re.search(
+        r"\b(?:bajo|debajo|agotad\w*|minim\w*|vencim\w*|"
+        r"por almac\w*|por categor\w*|solo en|solamente en)\b", n))
+    if not (quiere_ranking and habla_valor and habla_producto) or hay_filtro_extra:
+        return None
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty:
+        return ("No hay datos de inventario disponibles para calcular el ranking.", [], None,
+                {"tipo": "sin_datos"})
+    if "valor_stock" not in vista.columns:
+        return ("No es posible calcular el ranking: falta la columna valor_stock.", [], None,
+                {"tipo": "columna_faltante"})
+    agrupacion = ("id_producto" if "id_producto" in vista.columns else
+                  "producto" if "producto" in vista.columns else None)
+    if agrupacion is None:
+        return ("No puedo distinguir productos: falta id_producto o producto.", [], None,
+                {"tipo": "columna_faltante"})
+    cantidad = re.search(r"\b(?:top\s*)?(\d{1,3})\s*(?:productos?|articulos?)\b", n)
+    if not cantidad:
+        cantidad = re.search(r"\btop\s*(\d{1,3})\b", n)
+    limite = max(1, min(int(cantidad.group(1)) if cantidad else 10, 100))
+    # Para evitar resultados erróneos si un valor no es numérico, exigir datos válidos.
+    valor = pd.to_numeric(vista["valor_stock"], errors="coerce")
+    if valor.isna().any():
+        return ("Hay valores de inventario ausentes o no numéricos; no puedo confirmar un ranking completo sin revisarlos.",
+                [], None, {"tipo": "valor_incompleto", "registros_incompletos": int(valor.isna().sum())})
+    visual = ("ambos" if "tabla" in n and re.search(r"\b(?:grafico|barras|circular)\b", n) else
+              "tabla" if "tabla" in n else
+              "grafico" if re.search(r"\b(?:grafico|barras|circular|pastel|donut)\b", n) else
+              "texto")
+    plan = {"tabla": "vista_inventario", "operacion": "sum", "campo": "valor_stock",
+            "agrupar": agrupacion, "filtros": [], "orden": "desc", "limite": limite,
+            "visual": visual}
+    resumen, tablas, grafico, detalles = calcular(plan, datos, pregunta)
+    if resumen.startswith("No "):
+        return resumen, tablas, grafico, detalles
+    # El motor entrega cifras comprobadas; no delegar al modelo la reconstrucción
+    # de un ranking, evitando cambiar cifras u ofrecer preguntas no solicitadas.
+    cantidad_real = min(limite, int(vista[agrupacion].nunique(dropna=True)))
+    encabezado = f"**Los {cantidad_real} productos de mayor valor del inventario:**"
+    nota = "\n\n*Valores expresados sin asumir una moneda.*"
+    if visual in ("grafico", "ambos") and grafico is not None:
+        return ("Aquí tienes el ranking de productos por valor del inventario." + nota,
+                tablas, grafico, detalles)
+    return encabezado + "\n\n" + resumen + nota, tablas, grafico, detalles
 
 
 def _control_stock_verificable(pregunta, datos):
@@ -1110,6 +1250,13 @@ def _analisis_movimientos_mensuales(pregunta, datos, historial):
 
 
 def consultar(pregunta, datos, historial):
+    conteo = _conteo_productos_verificable(pregunta, datos)
+    if conteo is not None:
+        return conteo
+    # Los rankings de valor son cálculos directos, con sus cifras exactas.
+    ranking = _ranking_valor_verificable(pregunta, datos)
+    if ranking is not None:
+        return ranking
     # Consultas críticas calculadas sin depender del JSON generado por Groq.
     control = _control_stock_verificable(pregunta, datos)
     if control is not None:
@@ -1160,7 +1307,7 @@ def consultar(pregunta, datos, historial):
                 resumen, tablas, grafico, detalles = calcular(plan, datos, pregunta)
                 if grafico is not None:
                     return ("Aquí tienes los mismos datos representados en el formato solicitado. "
-                            "Puedes seguir pidiendo cambios de visualización.", tablas, grafico, detalles)
+                            "", tablas, grafico, detalles)
         # Si la consulta anterior era la distribución de almacenes, recuperar esa misma métrica.
         contexto = " ".join(str(h.get("pregunta", "")) for h in historial[-6:])
         vista = datos.get("vista_inventario")
@@ -1274,5 +1421,5 @@ def consultar(pregunta, datos, historial):
     else:
         respuesta = _redactar(pregunta, historial, evidencia)
     if pide_visual and grafico is not None:
-        respuesta += "\n\n**Gráfico generado a partir de los datos del inventario.**"
+        respuesta = "Aquí tienes el gráfico generado con los datos consultados de tu inventario."
     return respuesta, tablas, grafico, detalles
