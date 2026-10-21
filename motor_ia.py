@@ -1529,7 +1529,49 @@ def _priorizar_reposicion_verificable(pregunta, datos):
     return texto, ([('Prioridades de revisión', tabla)] if pide_tabla else []), figura, detalles
 
 
+def _resumen_general_verificable(pregunta, datos):
+    """Responde al resumen de tres indicadores sin depender del plan de Groq."""
+    n = sin_tildes(pregunta)
+    solicita_productos = bool(re.search(r"\bproductos?\b", n))
+    solicita_existencias = bool(re.search(r"\b(?:existencias?|unidades|stock)\b", n))
+    solicita_valor = bool(re.search(r"\bvalor\b", n))
+    solicita_resumen = bool(re.search(r"\b(?:resumen|indicadores|panorama)\b", n)) and bool(re.search(r"\binventario\b", n))
+    # Evitar interferir con rankings, consultas por almacén o reposición.
+    if not ((solicita_productos and solicita_existencias and solicita_valor) or solicita_resumen):
+        return None
+    if re.search(r"\b(?:top|ranking|mayores|menores|reponer|reposicion|por almacen|grafico)\b", n):
+        return None
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty:
+        return ("No hay datos disponibles para calcular el resumen del inventario.", [], None, {"tipo": "sin_datos"})
+    identificador = next((c for c in ("id_producto", "producto") if c in vista.columns), None)
+    requeridas = [c for c in (identificador, "stock_actual", "valor_stock") if c]
+    faltantes = [c for c in ("stock_actual", "valor_stock") if c not in vista.columns]
+    if identificador is None:
+        faltantes.insert(0, "id_producto o producto")
+    if faltantes:
+        return ("No puedo calcular el resumen completo: faltan las columnas " + ", ".join(faltantes) + ".", [], None, {"tipo": "columnas_faltantes"})
+    stock = pd.to_numeric(vista["stock_actual"], errors="coerce")
+    valor = pd.to_numeric(vista["valor_stock"], errors="coerce")
+    if stock.isna().any() or valor.isna().any() or vista[identificador].isna().any():
+        return ("No puedo garantizar el resumen completo: hay datos de producto, stock o valor ausentes o no numéricos.", [], None, {"tipo": "datos_incompletos"})
+    productos = int(vista[identificador].nunique())
+    total_stock = float(stock.sum())
+    total_valor = float(valor.sum())
+    texto = (f"**Resumen general del inventario**\n\n"
+             f"- **Productos únicos:** {_numero_es(productos)}\n"
+             f"- **Existencias registradas:** {_numero_es(total_stock)}\n"
+             f"- **Valor total del inventario:** {_numero_es(total_valor)}\n\n"
+             "Las existencias pueden incluir diferentes unidades de medida. "
+             "El valor se muestra sin asumir una moneda.")
+    return texto, [], None, {"tipo": "resumen_general", "productos_unicos": productos,
+                              "stock_total": total_stock, "valor_total": total_valor}
+
+
 def _consultar_interno(pregunta, datos, historial):
+    resumen_general = _resumen_general_verificable(pregunta, datos)
+    if resumen_general is not None:
+        return resumen_general
     reposicion = _priorizar_reposicion_verificable(pregunta, datos)
     if reposicion is not None:
         return reposicion
