@@ -584,6 +584,10 @@ def _redactar(pregunta, historial, evidencia, solo_contexto=False):
         "Nunca infieras márgenes, rentabilidad, punto de equilibrio, ventas estables "
         "ni demanda o velocidad de venta a partir del valor del inventario. "
         "No supongas que artículos aparentemente comunes tienen alta demanda. "
+        "Nunca digas que desconoces las existencias por producto cuando el resultado "
+        "del inventario permite consultarlas. Si el usuario pide qué productos revisar "
+        "o reponer, consulta y compara existencias reales por identificador, sin "
+        "inventar necesidades de compra ni demanda. "
         "Antes de pedir al usuario datos externos, usa la evidencia disponible; "
         "si no hay registros de ventas, explica que las salidas pueden no ser ventas. "
         "Al recibir una solicitud de diagnóstico global, usa hechos, riesgos y tres acciones "
@@ -1355,7 +1359,180 @@ def _analisis_movimientos_mensuales(pregunta, datos, historial):
         "tipo": "salidas_mensuales", "filas_filtradas": len(df)}
 
 
+
+def _priorizar_reposicion_verificable(pregunta, datos):
+    """Prioriza qué productos REVISAR para reposición usando existencias reales.
+
+    No confunde stock=0 por almacén con agotamiento global. Si los mínimos
+    son 0, no inventa demanda, urgencias, días de cobertura ni ventas.
+    Nunca depende de Groq para consultar el inventario por producto.
+    """
+    n = sin_tildes(pregunta)
+    menciona_productos = bool(re.search(r"\b(?:productos?|articulos?|referencias?)\b", n))
+    pide_priorizacion = bool(re.search(
+        r"\b(?:reponer|reposicion|reabastec\w*|prioriz\w*|prioridad(?:es)?|"
+        r"revisar\s+(?:primero|antes)|comprar\s+primero|"
+        r"criticos?|criticas?|riesgo\s+de\s+desabastecimiento)\b", n))
+    if not (menciona_productos and pide_priorizacion):
+        return None
+    # Consultas de conteo o comparación matemática explícitas tienen otros motores.
+    if (re.search(r"\b(?:cuantos?|cantidad|numero)\b", n)
+            and re.search(r"\b(?:bajo|debajo|menor|inferior)\b", n)
+            and "minim" in n):
+        return None
+
+    vista = datos.get("vista_inventario")
+    if vista is None or vista.empty:
+        return ("No tengo registros cargados de inventario para priorizar productos.",
+                [], None, {"tipo": "reposicion_sin_datos"})
+    identificador = ("id_producto" if "id_producto" in vista.columns
+                     else "producto" if "producto" in vista.columns else None)
+    if identificador is None or "stock_actual" not in vista.columns:
+        return ("No puedo priorizar productos de forma verificable porque faltan "
+                "el identificador de producto o el stock_actual en la vista de inventario.",
+                [], None, {"tipo": "reposicion_columnas_faltantes"})
+
+    base = vista.copy()
+    base["_stock"] = pd.to_numeric(base["stock_actual"], errors="coerce")
+    base["_id"] = base[identificador]
+    base = base.loc[base["_id"].notna() & base["_id"].astype(str).str.strip().ne("")].copy()
+    if base.empty:
+        return ("No hay productos con identificadores válidos para analizar la reposición.",
+                [], None, {"tipo": "reposicion_sin_identificadores"})
+    if "stock_minimo" in base.columns:
+        base["_minimo"] = pd.to_numeric(base["stock_minimo"], errors="coerce")
+    else:
+        base["_minimo"] = float("nan")
+    base["_bajo_minimo"] = (
+        base["_stock"].notna() & base["_minimo"].notna()
+        & base["_minimo"].gt(0) & base["_stock"].lt(base["_minimo"])
+    )
+    base["_cero"] = base["_stock"].eq(0)
+
+    resumen = (base.groupby("_id", dropna=False)
+               .agg(
+                   stock_total=("_stock", lambda x: x.sum(min_count=1)),
+                   sin_dato=("_stock", lambda x: int(x.isna().sum())),
+                   registros=("_stock", "size"),
+                   registros_cero=("_cero", "sum"),
+                   bajo_minimo=("_bajo_minimo", "sum"),
+               ).reset_index())
+    # No clasificar como disponible ni agotado un producto con stock desconocido.
+    incompletos = int((resumen["sin_dato"] > 0).sum())
+    evaluables = resumen.loc[resumen["sin_dato"].eq(0)].copy()
+    if evaluables.empty:
+        return ("Los productos tienen cantidades faltantes o no numéricas. "
+                "No puedo priorizarlos con seguridad hasta corregir esos registros.",
+                [], None, {"tipo": "reposicion_stock_incompleto"})
+
+    # Nombres solo para presentación: el cálculo SIEMPRE agrupa por ID cuando existe.
+    nombres = None
+    if identificador == "id_producto" and "producto" in base.columns:
+        validos = base.dropna(subset=["producto"])
+        validos = validos.loc[validos["producto"].astype(str).str.strip().ne("")]
+        if not validos.empty:
+            nombres = validos.drop_duplicates("_id").set_index("_id")["producto"]
+    if nombres is None and identificador == "id_producto":
+        catalogo = datos.get("productos")
+        if catalogo is not None and not catalogo.empty and "id_producto" in catalogo.columns:
+            campo_nombre = next((c for c in ("nombre", "nombre_producto", "producto", "descripcion")
+                                 if c in catalogo.columns), None)
+            if campo_nombre:
+                catalogo = catalogo.dropna(subset=[campo_nombre]).drop_duplicates("id_producto")
+                nombres = catalogo.set_index("id_producto")[campo_nombre]
+
+    def etiqueta(producto_id):
+        if nombres is not None:
+            valor = nombres.get(producto_id)
+            if valor is not None and pd.notna(valor) and str(valor).strip():
+                return str(valor)
+        return str(producto_id)
+
+    # 0 = agotado global, 1 = bajo mínimo positivo en alguna ubicación,
+    # 2 = stock conocido, sin señal demostrada de urgencia de compra.
+    evaluables["_grupo"] = 2
+    evaluables.loc[evaluables["bajo_minimo"].gt(0), "_grupo"] = 1
+    evaluables.loc[evaluables["stock_total"].eq(0), "_grupo"] = 0
+    evaluables = evaluables.sort_values(
+        ["_grupo", "stock_total", "registros_cero", "_id"],
+        ascending=[True, True, False, True], key=None, kind="stable"
+    )
+    # Si IDs tienen tipos mezclados, pandas puede no ordenar; ordenar por nombre
+    # sin afectar el orden de prioridad material.
+    limite_match = re.search(r"\b(?:top\s*)?(\d{1,2})\s*productos?\b", n)
+    limite = max(1, min(int(limite_match.group(1)) if limite_match else 10, 30))
+    seleccion = evaluables.head(limite).copy()
+
+    lineas = []
+    for i in range(1, len(seleccion) + 1):
+        # Acceso posicional en el orden estable del DataFrame.
+        registro = seleccion.iloc[i-1]
+        producto = etiqueta(registro["_id"])
+        total = _numero_es(registro["stock_total"])
+        grupo = int(registro["_grupo"])
+        if grupo == 0:
+            motivo = "sin existencias totales entre los almacenes"
+        elif grupo == 1:
+            motivo = (f"bajo el mínimo positivo en "
+                      f"{int(registro['bajo_minimo'])} registro(s) de almacén")
+        else:
+            motivo = "entre las menores existencias totales registradas"
+        ceros = int(registro["registros_cero"])
+        if ceros and grupo != 0:
+            motivo += f"; stock cero en {ceros} registro(s) de almacén"
+        lineas.append(f"{i}. **{producto}** — {total} de stock total. {motivo.capitalize()}.")
+
+    agotados = int(evaluables["_grupo"].eq(0).sum())
+    alertas = int(evaluables["_grupo"].eq(1).sum())
+    minimos_cero = int(base["_minimo"].eq(0).sum())
+    texto = ("**Productos que conviene revisar primero para planificar reposición**"
+             + "\n\n" + "\n".join(lineas))
+    texto += (f"\n\n**Diagnóstico:** {agotados} productos completamente agotados y "
+              f"{alertas} productos con alguna ubicación por debajo de un mínimo positivo "
+              "entre los registros evaluables.")
+    if agotados == 0 and alertas == 0:
+        texto += (" El orden presentado prioriza la revisión de los stocks totales más bajos; "
+                  "**no demuestra que haya que comprar esos productos**.")
+    if minimos_cero:
+        texto += (f"\n\n**Limitación importante:** hay {minimos_cero} registros con "
+                  "stock mínimo configurado en cero. Sin mínimos adecuados y demanda histórica "
+                  "no es posible determinar cantidades de compra, urgencia real ni días de cobertura.")
+    else:
+        texto += ("\n\n**Recomendación:** contrastar los productos listados con su "
+                  "demanda, tiempo de entrega y criticidad antes de emitir una orden de compra.")
+    if incompletos:
+        texto += (f"\n\n**Datos incompletos:** {incompletos} productos no se priorizaron "
+                  "porque algún registro de existencias carece de un valor numérico.")
+    if "unidad_medida" in base.columns and base["unidad_medida"].dropna().nunique() > 1:
+        texto += ("\n\n*Las cantidades pueden corresponder a distintas unidades de "
+                  "medida; se comparan existencias por producto, no se equiparan unidades entre artículos.*")
+
+    muestra = seleccion.copy()
+    muestra["Producto"] = muestra["_id"].map(etiqueta)
+    muestra["Stock total"] = muestra["stock_total"]
+    muestra["Registros sin stock"] = muestra["registros_cero"].astype(int)
+    muestra["Alertas bajo mínimo"] = muestra["bajo_minimo"].astype(int)
+    tabla = muestra[["Producto", "Stock total", "Registros sin stock", "Alertas bajo mínimo"]]
+    pide_tabla = bool(re.search(r"\b(?:tabla|cuadro|listado tabular)\b", n))
+    pide_grafico = bool(re.search(r"\b(?:grafico|graficas?|barras|circular)\b", n))
+    figura = None
+    if pide_grafico:
+        figura = px.bar(tabla, x="Producto", y="Stock total", title="Existencias de productos para revisar")
+        figura = _mejorar_contraste_grafico(figura)
+    detalles = {"tipo": "priorizacion_reposicion", "productos_evaluados": len(evaluables),
+                "agotados_globales": agotados, "productos_bajo_minimo": alertas,
+                "filas_filtradas": len(seleccion),
+                "plan": {"tabla": "vista_inventario", "operacion": "sum",
+                         "campo": "stock_actual", "agrupar": identificador,
+                         "filtros": [], "orden": "asc", "limite": limite,
+                         "visual": "texto"}}
+    return texto, ([('Prioridades de revisión', tabla)] if pide_tabla else []), figura, detalles
+
+
 def _consultar_interno(pregunta, datos, historial):
+    reposicion = _priorizar_reposicion_verificable(pregunta, datos)
+    if reposicion is not None:
+        return reposicion
     conteo = _conteo_productos_verificable(pregunta, datos)
     if conteo is not None:
         return conteo
